@@ -370,7 +370,7 @@ int main(int argc, char *argv[]) {
 
         printf("\nARP Tablosu:\n");
     #ifdef __APPLE__
-        system("arp -a");
+       // system("arp -a");
     #else
         system("arp -n");
     #endif
