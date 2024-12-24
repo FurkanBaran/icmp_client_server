@@ -1,34 +1,49 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <pcap.h>
-#include <string.h>
-#include <unistd.h>
-#include <signal.h>
-#include <ifaddrs.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <net/if.h>
-#include <errno.h>
-
-#ifdef __APPLE__
-    #include <net/if_dl.h>
-    #include <net/if_types.h>
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #include <windows.h>
+    #include <pcap.h>
+    #pragma comment(lib, "wpcap.lib")
+    #pragma comment(lib, "ws2_32.lib")
+    #define PCAP_BUF_SIZE 65536
 #else
-    #include <sys/ioctl.h>
-    #include <linux/if_ether.h>
-    #include <linux/if_arp.h>
+    #include <pcap.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <sys/socket.h>
+    #include <netinet/if_ether.h>
+    #include <net/if.h>
+    #ifdef __APPLE__
+        #include <net/if_dl.h>
+        #include <net/if_types.h>
+        #include <ifaddrs.h>
+    #else
+        #include <sys/ioctl.h>
+        #include <linux/if_ether.h>
+        #include <ifaddrs.h>
+    #endif
+    #include <unistd.h>
 #endif
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <errno.h>
+#include <time.h>
+typedef unsigned char u_char;
 #define TTL_VALUE 64
-#define ETH_ALEN 6
-#define ETH_P_IP 0x0800
+#define ETHERNET_HEADER_LEN 14
+#define IP_HEADER_LEN 20
+#define ICMP_HEADER_LEN 8
+#define PACKET_SIZE (ETHERNET_HEADER_LEN + IP_HEADER_LEN + ICMP_HEADER_LEN)
 
 #pragma pack(1)
-struct eth_header {
-    uint8_t h_dest[ETH_ALEN];
-    uint8_t h_source[ETH_ALEN];
-    uint16_t h_proto;
-};
+typedef struct {
+    uint8_t dest_mac[6];
+    uint8_t src_mac[6];
+    uint16_t ether_type;
+} EthernetHeader;
 
 typedef struct {
     uint8_t version_ihl;
@@ -54,38 +69,38 @@ typedef struct {
 
 pcap_t *handle = NULL;
 volatile sig_atomic_t keep_running = 1;
-volatile sig_atomic_t received_sigint = 0;
 unsigned long packets_received = 0;
 unsigned long packets_sent = 0;
 
+#ifdef _WIN32
+BOOL WINAPI console_handler(DWORD signal) {
+    if (signal == CTRL_C_EVENT) {
+        keep_running = 0;
+        printf("\nSunucu kapatılıyor...\n");
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
 void signal_handler(int signum) {
-    received_sigint = 1;
     keep_running = 0;
     printf("\nSunucu kapatılıyor...\n");
 }
-
-void cleanup() {
-    if (handle) {
-        pcap_close(handle);
-    }
-    printf("\n--- Sunucu İstatistikleri ---\n");
-    printf("Alınan paket: %lu\n", packets_received);
-    printf("Gönderilen yanıt: %lu\n", packets_sent);
-}
+#endif
 
 void print_packet_info(const u_char *packet, int is_sent) {
-    struct eth_header *eth = (struct eth_header *)packet;
-    IPHeader *ip = (IPHeader *)(packet + sizeof(struct eth_header));
-    ICMPHeader *icmp = (ICMPHeader *)(packet + sizeof(struct eth_header) + sizeof(IPHeader));
+    EthernetHeader *eth = (EthernetHeader *)packet;
+    IPHeader *ip = (IPHeader *)(packet + ETHERNET_HEADER_LEN);
+    ICMPHeader *icmp = (ICMPHeader *)(packet + ETHERNET_HEADER_LEN + IP_HEADER_LEN);
 
     printf("\n%s Paket Detayları:\n", is_sent ? "Gönderilen" : "Alınan");
     printf("MAC Adresleri:\n");
     printf("  Kaynak: %02x:%02x:%02x:%02x:%02x:%02x\n",
-           eth->h_source[0], eth->h_source[1], eth->h_source[2],
-           eth->h_source[3], eth->h_source[4], eth->h_source[5]);
+           eth->src_mac[0], eth->src_mac[1], eth->src_mac[2],
+           eth->src_mac[3], eth->src_mac[4], eth->src_mac[5]);
     printf("  Hedef: %02x:%02x:%02x:%02x:%02x:%02x\n",
-           eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
-           eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+           eth->dest_mac[0], eth->dest_mac[1], eth->dest_mac[2],
+           eth->dest_mac[3], eth->dest_mac[4], eth->dest_mac[5]);
 
     char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(ip->source_ip), src_ip, INET_ADDRSTRLEN);
@@ -126,12 +141,82 @@ unsigned short calculate_checksum(unsigned short *addr, int len) {
     return answer;
 }
 
+int get_interface_mac(const char *interface, uint8_t *mac_addr) {
+#ifdef _WIN32
+    pcap_if_t *alldevs;
+    char errbuf[PCAP_ERRBUF_SIZE];
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) return -1;
+    
+    for (pcap_if_t *d = alldevs; d != NULL; d = d->next) {
+        if (strcmp(d->name, interface) == 0) {
+            // Windows için MAC adresi alma işlemi
+            // Bu kısım Windows API'si kullanılarak implement edilmeli
+            memset(mac_addr, 0x01, 6); // Geçici çözüm
+            pcap_freealldevs(alldevs);
+            return 0;
+        }
+    }
+    pcap_freealldevs(alldevs);
+    return -1;
+#elif defined(__APPLE__)
+    struct ifaddrs *ifap, *ifaptr;
+    unsigned char *ptr;
+    
+    if (getifaddrs(&ifap) == 0) {
+        for (ifaptr = ifap; ifaptr != NULL; ifaptr = ifaptr->ifa_next) {
+            if (strcmp(ifaptr->ifa_name, interface) == 0 && 
+                ifaptr->ifa_addr->sa_family == AF_LINK) {
+                ptr = (unsigned char *)LLADDR((struct sockaddr_dl *)ifaptr->ifa_addr);
+                memcpy(mac_addr, ptr, 6);
+                freeifaddrs(ifap);
+                return 0;
+            }
+        }
+        freeifaddrs(ifap);
+    }
+    return -1;
+#else // Linux
+    struct ifreq ifr;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+
+    strncpy(ifr.ifr_name, interface, IFNAMSIZ-1);
+    if (ioctl(sock, SIOCGIFHWADDR, &ifr) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    memcpy(mac_addr, ifr.ifr_hwaddr.sa_data, 6);
+    close(sock);
+    return 0;
+#endif
+}
+
 char* get_interface_ip(const char *interface) {
-    struct ifaddrs *ifaddr, *ifa;
     static char ip[INET_ADDRSTRLEN];
+#ifdef _WIN32
+    pcap_if_t *alldevs;
+    char errbuf[PCAP_ERRBUF_SIZE];
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) return NULL;
+    
+    for (pcap_if_t *d = alldevs; d != NULL; d = d->next) {
+        if (strcmp(d->name, interface) == 0) {
+            for (pcap_addr_t *a = d->addresses; a != NULL; a = a->next) {
+                if (a->addr->sa_family == AF_INET) {
+                    struct sockaddr_in *sin = (struct sockaddr_in *)a->addr;
+                    inet_ntop(AF_INET, &(sin->sin_addr), ip, INET_ADDRSTRLEN);
+                    pcap_freealldevs(alldevs);
+                    return ip;
+                }
+            }
+        }
+    }
+    pcap_freealldevs(alldevs);
+    return NULL;
+#else
+    struct ifaddrs *ifaddr, *ifa;
     
     if (getifaddrs(&ifaddr) == -1) {
-        perror("getifaddrs");
         return NULL;
     }
 
@@ -149,56 +234,23 @@ char* get_interface_ip(const char *interface) {
 
     freeifaddrs(ifaddr);
     return NULL;
-}
-
-int get_interface_mac(const char *interface, uint8_t *mac_addr) {
-#ifdef __APPLE__
-    struct ifaddrs *ifap, *ifaptr;
-    
-    if (getifaddrs(&ifap) == 0) {
-        for (ifaptr = ifap; ifaptr != NULL; ifaptr = ifaptr->ifa_next) {
-            if (strcmp(ifaptr->ifa_name, interface) == 0 && 
-                ifaptr->ifa_addr->sa_family == AF_LINK) {
-                struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifaptr->ifa_addr;
-                memcpy(mac_addr, LLADDR(sdl), 6);
-                freeifaddrs(ifap);
-                return 0;
-            }
-        }
-        freeifaddrs(ifap);
-    }
-    return -1;
-#else
-    struct ifreq ifr;
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return -1;
-
-    strncpy(ifr.ifr_name, interface, IFNAMSIZ-1);
-    if (ioctl(sock, SIOCGIFHWADDR, &ifr) < 0) {
-        close(sock);
-        return -1;
-    }
-
-    memcpy(mac_addr, ifr.ifr_hwaddr.sa_data, 6);
-    close(sock);
-    return 0;
 #endif
 }
 
 void send_icmp_reply(pcap_t *handle, const u_char *request_packet) {
-    uint8_t reply_packet[sizeof(struct eth_header) + sizeof(IPHeader) + sizeof(ICMPHeader)];
-    memset(reply_packet, 0, sizeof(reply_packet));
+    u_char reply_packet[PACKET_SIZE];
+    memset(reply_packet, 0, PACKET_SIZE);
 
     // Ethernet header
-    struct eth_header *eth_reply = (struct eth_header *)reply_packet;
-    struct eth_header *eth_request = (struct eth_header *)request_packet;
-    memcpy(eth_reply->h_dest, eth_request->h_source, ETH_ALEN);
-    memcpy(eth_reply->h_source, eth_request->h_dest, ETH_ALEN);
-    eth_reply->h_proto = eth_request->h_proto;
+    EthernetHeader *eth_reply = (EthernetHeader *)reply_packet;
+    EthernetHeader *eth_request = (EthernetHeader *)request_packet;
+    memcpy(eth_reply->dest_mac, eth_request->src_mac, 6);
+    memcpy(eth_reply->src_mac, eth_request->dest_mac, 6);
+    eth_reply->ether_type = eth_request->ether_type;
 
     // IP header
-    IPHeader *ip_reply = (IPHeader *)(reply_packet + sizeof(struct eth_header));
-    IPHeader *ip_request = (IPHeader *)(request_packet + sizeof(struct eth_header));
+    IPHeader *ip_reply = (IPHeader *)(reply_packet + ETHERNET_HEADER_LEN);
+    IPHeader *ip_request = (IPHeader *)(request_packet + ETHERNET_HEADER_LEN);
     memcpy(ip_reply, ip_request, sizeof(IPHeader));
     ip_reply->dest_ip = ip_request->source_ip;
     ip_reply->source_ip = ip_request->dest_ip;
@@ -207,8 +259,8 @@ void send_icmp_reply(pcap_t *handle, const u_char *request_packet) {
     ip_reply->header_checksum = calculate_checksum((unsigned short *)ip_reply, sizeof(IPHeader));
 
     // ICMP header
-    ICMPHeader *icmp_reply = (ICMPHeader *)(reply_packet + sizeof(struct eth_header) + sizeof(IPHeader));
-    ICMPHeader *icmp_request = (ICMPHeader *)(request_packet + sizeof(struct eth_header) + sizeof(IPHeader));
+    ICMPHeader *icmp_reply = (ICMPHeader *)(reply_packet + ETHERNET_HEADER_LEN + IP_HEADER_LEN);
+    ICMPHeader *icmp_request = (ICMPHeader *)(request_packet + ETHERNET_HEADER_LEN + IP_HEADER_LEN);
     icmp_reply->type = 0;  // Echo Reply
     icmp_reply->code = 0;
     icmp_reply->identifier = icmp_request->identifier;
@@ -218,7 +270,7 @@ void send_icmp_reply(pcap_t *handle, const u_char *request_packet) {
 
     print_packet_info(reply_packet, 1);
     
-    if (pcap_sendpacket(handle, reply_packet, sizeof(reply_packet)) != 0) {
+    if (pcap_sendpacket(handle, reply_packet, PACKET_SIZE) != 0) {
         fprintf(stderr, "Yanıt gönderilemedi: %s\n", pcap_geterr(handle));
     } else {
         packets_sent++;
@@ -226,18 +278,42 @@ void send_icmp_reply(pcap_t *handle, const u_char *request_packet) {
     }
 }
 
+void init_platform() {
+#ifdef _WIN32
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        exit(1);
+    }
+    SetConsoleCtrlHandler(console_handler, TRUE);
+#else
+    signal(SIGINT, signal_handler);
+#endif
+}
+
+void cleanup() {
+    if (handle) {
+        pcap_close(handle);
+    }
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    printf("\n--- Sunucu İstatistikleri ---\n");
+    printf("Alınan paket: %lu\n", packets_received);
+    printf("Gönderilen yanıt: %lu\n", packets_sent);
+}
+
 int main() {
+    init_platform();
+
+#ifdef _WIN32
+    if (!IsUserAnAdmin()) {
+#else
     if (getuid() != 0) {
-        fprintf(stderr, "Root yetkisi gerekli!\n");
+#endif
+        fprintf(stderr, "Yönetici/root yetkisi gerekli!\n");
         return 1;
     }
-
-    struct sigaction sa;
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
 
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_if_t *alldevs;
@@ -258,7 +334,7 @@ int main() {
     }
     printf("Server IP: %s\n", server_ip);
 
-    handle = pcap_open_live(interface, BUFSIZ, 1, 100, errbuf);
+    handle = pcap_open_live(interface, BUFSIZ, 1, 1000, errbuf);
     if (!handle) {
         fprintf(stderr, "pcap_open_live hatası: %s\n", errbuf);
         pcap_freealldevs(alldevs);
@@ -288,17 +364,9 @@ int main() {
     const u_char *packet;
 
     while (keep_running) {
-        if (received_sigint) {
-            break;
-        }
-
         int res = pcap_next_ex(handle, &header, &packet);
         if (res == 0) continue;  // Timeout
         if (res < 0) break;      // Hata
-
-        if (received_sigint) {
-            break;
-        }
 
         packets_received++;
         printf("\nICMP Echo Request alındı (#%lu)\n", packets_received);
