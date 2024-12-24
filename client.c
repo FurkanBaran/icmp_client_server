@@ -368,12 +368,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("\nARP Tablosu:\n");
-    system("arp -n");
+        printf("\nARP Tablosu:\n");
+    #ifdef __APPLE__
+        system("arp -a");
+    #else
+        system("arp -n");
+    #endif
 
     struct bpf_program fp;
-    char filter_exp[100];
-    snprintf(filter_exp, sizeof(filter_exp), "icmp");
+    char filter_exp[256];
+    #ifdef __APPLE__
+        // macOS için daha spesifik filtre
+        snprintf(filter_exp, sizeof(filter_exp), 
+                "icmp and not (src host %s and dst host %s)", 
+                source_ip, argv[1]);
+    #else
+        // Linux için mevcut filtre
+        snprintf(filter_exp, sizeof(filter_exp), "icmp");
+    #endif
+
     if (pcap_compile(handle, &fp, filter_exp, 0, PCAP_NETMASK_UNKNOWN) == -1) {
         fprintf(stderr, "Filter derlenemedi\n");
         cleanup();
