@@ -8,60 +8,129 @@
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <linux/if_ether.h>
+#include <linux/if_arp.h>
+#include <errno.h>
 
 typedef unsigned char u_char;
 
-// Global değişkenler
+#define TIMEOUT_SEC 3
+#define MAX_TRIES 4
+#define TTL_VALUE 64
+#define ICMP_ECHO_REQUEST 8
+#define ICMP_ECHO_REPLY 0
+#define ICMP_DEST_UNREACHABLE 3
+
+struct timeval send_time;  
+
+
+typedef struct {
+    uint8_t type;
+    uint8_t code;
+    uint16_t checksum;
+    uint16_t identifier;
+    uint16_t sequence;
+} ICMPHeader;
+
+typedef struct {
+    uint8_t version_ihl;
+    uint8_t tos;
+    uint16_t total_length;
+    uint16_t identification;
+    uint16_t flags_fragment_offset;
+    uint8_t ttl;
+    uint8_t protocol;
+    uint16_t header_checksum;
+    uint32_t source_ip;
+    uint32_t dest_ip;
+} IPHeader;
+
 pcap_t *handle = NULL;
 volatile sig_atomic_t keep_running = 1;
-unsigned long packets_sent = 0;
-unsigned long packets_received = 0;
+struct timeval timeout_tv;
+unsigned short sequence = 0;
+char source_ip_str[INET_ADDRSTRLEN];
 
-// Sinyal yakalayıcı
-void signal_handler(int signum) {
-    keep_running = 0;
+void print_packet_info(const u_char *packet, int is_sent) {
+    struct ethhdr *eth = (struct ethhdr *)packet;
+    IPHeader *ip = (IPHeader *)(packet + sizeof(struct ethhdr));
+    ICMPHeader *icmp = (ICMPHeader *)(packet + sizeof(struct ethhdr) + sizeof(IPHeader));
+
+    printf("\n%s Paket Detayları:\n", is_sent ? "Gönderilen" : "Alınan");
+    printf("MAC Adresleri:\n");
+    printf("  Kaynak: %02x:%02x:%02x:%02x:%02x:%02x\n",
+           eth->h_source[0], eth->h_source[1], eth->h_source[2],
+           eth->h_source[3], eth->h_source[4], eth->h_source[5]);
+    printf("  Hedef: %02x:%02x:%02x:%02x:%02x:%02x\n",
+           eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
+           eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+
+    char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(ip->source_ip), src_ip, INET_ADDRSTRLEN);
+    inet_ntop(AF_INET, &(ip->dest_ip), dst_ip, INET_ADDRSTRLEN);
+
+    printf("IP Adresleri:\n");
+    printf("  Kaynak: %s\n", src_ip);
+    printf("  Hedef: %s\n", dst_ip);
+    printf("  TTL: %d\n", ip->ttl);
+
+    printf("ICMP Bilgileri:\n");
+    printf("  Tip: 0x%02x\n", icmp->type);
+    printf("  Kod: 0x%02x\n", icmp->code);
+    printf("  Checksum: 0x%04x\n", ntohs(icmp->checksum));
+    printf("  Identifier: 0x%04x\n", ntohs(icmp->identifier));
+    printf("  Sequence: 0x%04x\n", ntohs(icmp->sequence));
 }
 
-// Cleanup fonksiyonu
+void signal_handler(int signum) {
+    keep_running = 0;
+    printf("\nProgram sonlandırılıyor...\n");
+}
+
 void cleanup() {
     if (handle) {
         pcap_close(handle);
     }
-    printf("\n--- İstatistikler ---\n");
-    printf("Gönderilen paket: %lu\n", packets_sent);
-    printf("Alınan paket: %lu\n", packets_received);
 }
 
-// ICMP Checksum Hesaplama
-unsigned short calculate_checksum(unsigned short *p, int n) {
-    unsigned long sum = 0;
-    while (n > 1) {
-        sum += *p++;
-        n -= 2;
+unsigned short calculate_checksum(unsigned short *addr, int len) {
+    int nleft = len;
+    int sum = 0;
+    unsigned short *w = addr;
+    unsigned short answer = 0;
+
+    while (nleft > 1) {
+        sum += *w++;
+        nleft -= 2;
     }
-    if (n == 1) {
-        sum += *(unsigned char *)p;
+
+    if (nleft == 1) {
+        *(unsigned char *)(&answer) = *(unsigned char *)w;
+        sum += answer;
     }
-    sum = (sum >> 16) + (sum & 0xffff);
+
+    sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
-    return (unsigned short)(~sum);
+    answer = ~sum;
+    return answer;
 }
 
-// Arayüzün IP adresini alma
-char* get_interface_ip(const char *interface_name) {
+char* get_interface_ip(const char *interface) {
     struct ifaddrs *ifaddr, *ifa;
     static char ip[INET_ADDRSTRLEN];
     
     if (getifaddrs(&ifaddr) == -1) {
         perror("getifaddrs");
-        exit(EXIT_FAILURE);
+        return NULL;
     }
 
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL) continue;
 
         if (ifa->ifa_addr->sa_family == AF_INET && 
-            strcmp(ifa->ifa_name, interface_name) == 0) {
+            strcmp(ifa->ifa_name, interface) == 0) {
             struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
             inet_ntop(AF_INET, &addr->sin_addr, ip, INET_ADDRSTRLEN);
             freeifaddrs(ifaddr);
@@ -73,311 +142,251 @@ char* get_interface_ip(const char *interface_name) {
     return NULL;
 }
 
-// Paket içeriğini yazdırma fonksiyonu
-void print_packet_info(const u_char *packet, int is_sent) {
-    printf("\n%s Paket Detayları:\n", is_sent ? "Gönderilen" : "Alınan");
-    printf("MAC Adresleri:\n");
-    printf("  Kaynak: %02x:%02x:%02x:%02x:%02x:%02x\n",
-           packet[6], packet[7], packet[8], packet[9], packet[10], packet[11]);
-    printf("  Hedef: %02x:%02x:%02x:%02x:%02x:%02x\n",
-           packet[0], packet[1], packet[2], packet[3], packet[4], packet[5]);
+int get_interface_mac(const char *interface, uint8_t *mac_addr) {
+    struct ifreq ifr;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+
+    strncpy(ifr.ifr_name, interface, IFNAMSIZ-1);
+    if (ioctl(sock, SIOCGIFHWADDR, &ifr) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    memcpy(mac_addr, ifr.ifr_hwaddr.sa_data, 6);
+    close(sock);
+    return 0;
+}
+
+int send_icmp_request(pcap_t *handle, const char *interface, 
+                     struct in_addr src_ip, struct in_addr dest_ip) {
+    uint8_t packet[sizeof(struct ethhdr) + sizeof(IPHeader) + sizeof(ICMPHeader)];
+    memset(packet, 0, sizeof(packet));
+
+    struct ethhdr *eth = (struct ethhdr *)packet;
+    uint8_t src_mac[6];
+    if (get_interface_mac(interface, src_mac) < 0) {
+        fprintf(stderr, "MAC adresi alınamadı\n");
+        return -1;
+    }
+    memcpy(eth->h_source, src_mac, 6);
+    memset(eth->h_dest, 0xff, 6);
+    eth->h_proto = htons(ETH_P_IP);
+
+    IPHeader *ip = (IPHeader *)(packet + sizeof(struct ethhdr));
+    ip->version_ihl = 0x45;
+    ip->tos = 0;
+    ip->total_length = htons(sizeof(IPHeader) + sizeof(ICMPHeader));
+    ip->identification = htons(getpid() & 0xFFFF);
+    ip->flags_fragment_offset = 0;
+    ip->ttl = TTL_VALUE;
+    ip->protocol = IPPROTO_ICMP;
+    ip->source_ip = src_ip.s_addr;
+    ip->dest_ip = dest_ip.s_addr;
+    ip->header_checksum = 0;
+    ip->header_checksum = calculate_checksum((unsigned short *)ip, sizeof(IPHeader));
+
+    ICMPHeader *icmp = (ICMPHeader *)(packet + sizeof(struct ethhdr) + sizeof(IPHeader));
+    icmp->type = ICMP_ECHO_REQUEST;
+    icmp->code = 0;
+    icmp->identifier = htons(getpid() & 0xFFFF);
+    icmp->sequence = htons(++sequence);
+    icmp->checksum = 0;
+    icmp->checksum = calculate_checksum((unsigned short *)icmp, sizeof(ICMPHeader));
+
+    print_packet_info(packet, 1);
+    printf("ICMP Echo Request gönderiliyor...\n");
+    // Gönderim zamanını kaydet
+    gettimeofday(&send_time, NULL);
+
+    if (pcap_sendpacket(handle, packet, sizeof(packet)) != 0) {
+        fprintf(stderr, "Paket gönderilemedi: %s\n", pcap_geterr(handle));
+        return -1;
+    }
+
+    return 0;
+}
+
+int process_packet(const u_char *packet, int len) {
+    struct ethhdr *eth = (struct ethhdr *)packet;
+    if (ntohs(eth->h_proto) != ETH_P_IP) return 0;
+
+    IPHeader *ip = (IPHeader *)(packet + sizeof(struct ethhdr));
+    if (ip->protocol != IPPROTO_ICMP) return 0;
+
+    ICMPHeader *icmp = (ICMPHeader *)(packet + sizeof(struct ethhdr) + sizeof(IPHeader));
     
-    printf("IP Adresleri:\n");
-    printf("  Kaynak: %d.%d.%d.%d\n",
-           packet[26], packet[27], packet[28], packet[29]);
-    printf("  Hedef: %d.%d.%d.%d\n",
-           packet[30], packet[31], packet[32], packet[33]);
-    
-    printf("ICMP Bilgileri:\n");
-    printf("  Tip: 0x%02x\n", packet[34]);
-    printf("  Kod: 0x%02x\n", packet[35]);
-    printf("  Checksum: 0x%02x%02x\n", packet[36], packet[37]);
-    printf("  Identifier: 0x%02x%02x\n", packet[38], packet[39]);
-    printf("  Sequence: 0x%02x%02x\n", packet[40], packet[41]);
+    print_packet_info(packet, 0);
+    // Yanıt zamanını al ve süreyi hesapla
+    struct timeval recv_time, diff_time;
+    gettimeofday(&recv_time, NULL);
+    timersub(&recv_time, &send_time, &diff_time);
+    double ms = (diff_time.tv_sec * 1000.0) + (diff_time.tv_usec / 1000.0);
+
+    switch(icmp->type) {
+        case 0x00:  // Echo Reply
+            printf("ICMP Echo Reply alındı. (%.3f ms)\n", ms);
+            return 1;
+
+        case 0x03:  // Destination Unreachable
+            printf("ICMP Destination Unreachable: ");
+            switch(icmp->code) {
+                case 0x00:
+                    printf("Network Unreachable\n");
+                    break;
+                case 0x01:
+                    printf("Host Unreachable\n");
+                    break;
+                case 0x02:
+                    printf("Protocol Unreachable\n");
+                    break;
+                case 0x03:
+                    printf("Port Unreachable\n");
+                    break;
+                case 0x04:
+                    printf("Fragmentation Needed and Don't Fragment was Set\n");
+                    break;
+                default:
+                    printf("Code: 0x%02x\n", icmp->code);
+                    break;
+            }
+            return 1;
+
+        case 0x0b:  // Time Exceeded
+            printf("ICMP Time Exceeded: ");
+            switch(icmp->code) {
+                case 0x00:
+                    printf("TTL Exceeded in Transit\n");
+                    break;
+                case 0x01:
+                    printf("Fragment Reassembly Time Exceeded\n");
+                    break;
+                default:
+                    printf("Code: 0x%02x\n", icmp->code);
+                    break;
+            }
+            return 1;
+
+        default:
+            printf("Beklenmeyen ICMP paketi alındı (Type: 0x%02x, Code: 0x%02x) (%.3f ms)\n", 
+                   icmp->type, icmp->code, ms);
+            return 0;
+    }
 }
 
 int main(int argc, char *argv[]) {
-    char errbuffer[PCAP_ERRBUF_SIZE];
-    pcap_if_t *alldevs;
-    struct in_addr src_ip, dest_ip;
-
-    // Hedef IP kontrolü
     if (argc != 2) {
         fprintf(stderr, "Kullanım: %s <hedef_ip>\n", argv[0]);
-        fprintf(stderr, "Örnek: %s 192.168.1.100\n", argv[0]);
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
-    // Hedef IP'yi parse et
+    if (getuid() != 0) {
+        fprintf(stderr, "Root yetkisi gerekli!\n");
+        return 1;
+    }
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    struct in_addr src_ip, dest_ip;
+
     if (inet_pton(AF_INET, argv[1], &dest_ip) != 1) {
         fprintf(stderr, "Geçersiz IP adresi\n");
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
-    // Root kontrolü
-    if (getuid() != 0) {
-        fprintf(stderr, "Bu program root yetkisi gerektirir!\n");
-        exit(EXIT_FAILURE);
+    pcap_if_t *alldevs;
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+        fprintf(stderr, "Interface bulunamadı: %s\n", errbuf);
+        return 1;
     }
 
-    // Sinyal yakalayıcı kurulumu
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    char *interface = alldevs->name;
+    printf("Kullanılan arayüz: %s\n", interface);
 
-    // Network arayüzünü bul
-    if (pcap_findalldevs(&alldevs, errbuffer) == -1) {
-        fprintf(stderr, "Arayüz listesi alınamadı: %s\n", errbuffer);
-        exit(EXIT_FAILURE);
-    }
-
-    char *dev = alldevs->name;
-    printf("Kullanılan arayüz: %s\n", dev);
-
-    // Arayüzün IP adresini al
-    char *source_ip = get_interface_ip(dev);
+    // Kaynak IP'yi al
+    char *source_ip = get_interface_ip(interface);
     if (!source_ip) {
-        fprintf(stderr, "Arayüz IP adresi alınamadı\n");
+        fprintf(stderr, "Kaynak IP alınamadı\n");
         pcap_freealldevs(alldevs);
-        exit(EXIT_FAILURE);
+        return 1;
     }
     printf("Kaynak IP: %s\n", source_ip);
     printf("Hedef IP: %s\n", argv[1]);
 
     inet_pton(AF_INET, source_ip, &src_ip);
 
-    handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuffer);
-    pcap_freealldevs(alldevs);
-
-    if (handle == NULL) {
-        fprintf(stderr, "Arayüz açılamadı: %s\n", errbuffer);
-        exit(EXIT_FAILURE);
-    }
-
-    u_char packet[50];
-    memset(packet, 0, sizeof(packet));
-
-    // Ethernet Header
-    memset(packet, 0xff, 6);      // Destination MAC (broadcast)
-    memset(packet + 6, 0x01, 6);  // Source MAC
-    packet[12] = 0x08;  // IPv4
-    packet[13] = 0x00;
-
-    // IP Header
-    packet[14] = 0x45;  // Version & Header Length
-    packet[15] = 0x00;  // Type of Service
-    packet[16] = 0x00;  // Total Length (high byte)
-    packet[17] = 0x32;  // Total Length (low byte)
-    packet[18] = 0x1c;  // Identification (high byte)
-    packet[19] = 0x46;  // Identification (low byte)
-    packet[20] = 0x00;  // Flags and Fragment Offset
-    packet[21] = 0x00;
-    packet[22] = 0x01;  // TTL
-    packet[23] = 0x01;  // Protocol (ICMP)
-    packet[24] = 0x00;  // Header Checksum
-    packet[25] = 0x00;
-
-    // Source IP Address
-    memcpy(packet + 26, &src_ip.s_addr, 4);
-
-    // Destination IP Address
-    memcpy(packet + 30, &dest_ip.s_addr, 4);
-
-    // Calculate IP Checksum
-    unsigned short *ip_hdr = (unsigned short *)&packet[14];
-    unsigned short ip_checksum = calculate_checksum(ip_hdr, 20);
-    packet[24] = (ip_checksum >> 8) & 0xff;
-    packet[25] = ip_checksum & 0xff;
-
-    // ICMP Header
-    packet[34] = 0x08;  // Type (Echo Request)
-    packet[35] = 0x00;  // Code
-    packet[36] = 0x00;  // Checksum
-    packet[37] = 0x00;
-    packet[38] = 0x12;  // Identifier
-    packet[39] = 0x34;
-    packet[40] = 0x00;  // Sequence Number
-    packet[41] = 0x01;
-
-    // Calculate ICMP Checksum
-    unsigned short *icmp_hdr = (unsigned short *)&packet[34];
-    unsigned short icmp_checksum = calculate_checksum(icmp_hdr, 16);
-    packet[36] = (icmp_checksum >> 8) & 0xff;
-    packet[37] = icmp_checksum & 0xff;
-
-    // Gönderim öncesi paket bilgilerini yazdır
-    print_packet_info(packet, 1);
-
-    // Gönderim
-    if (pcap_sendpacket(handle, packet, sizeof(packet)) != 0) {
-        fprintf(stderr, "Paket gönderilemedi: %s\n", pcap_geterr(handle));
-        cleanup();
+    handle = pcap_open_live(interface, BUFSIZ, 1, 1000, errbuf);
+    if (!handle) {
+        fprintf(stderr, "pcap_open_live hatası: %s\n", errbuf);
+        pcap_freealldevs(alldevs);
         return 1;
     }
-    packets_sent++;
-    printf("ICMP Echo Request gönderildi.\n");
 
     // ARP tablosunu göster
     printf("\nARP Tablosu:\n");
     system("arp -n");
 
-    // Dinleme
-    struct pcap_pkthdr *header;
-    const u_char *recv_packet;
-    while (keep_running && pcap_next_ex(handle, &header, &recv_packet) >= 0) {
-        if (recv_packet[23] == 0x01) {  // Protocol ICMP
-            // Gelen paket bilgilerini yazdır
-            print_packet_info(recv_packet, 0);
+    struct bpf_program fp;
+    char filter_exp[100];
+    snprintf(filter_exp, sizeof(filter_exp), "icmp");
+    if (pcap_compile(handle, &fp, filter_exp, 0, PCAP_NETMASK_UNKNOWN) == -1) {
+        fprintf(stderr, "Filter derlenemedi\n");
+        cleanup();
+        return 1;
+    }
+    if (pcap_setfilter(handle, &fp) == -1) {
+        fprintf(stderr, "Filter uygulanamadı\n");
+        cleanup();
+        return 1;
+    }
 
-            // Kaynak IP kontrolü (bizim hedef IP'miz olmalı)
-            if (memcmp(recv_packet + 26, packet + 30, 4) == 0) {
-                printf("Yanıt bizim hedef IP'den geldi\n");
-                
-                // Hedef IP kontrolü (bizim IP'miz olmalı)
-                if (memcmp(recv_packet + 30, packet + 26, 4) == 0) {
-                    switch(recv_packet[34]) {  // ICMP Type
-                        case 0x00:  // Echo Reply
-                            printf("ICMP Echo Reply alındı.\n");
-                            packets_received++;
-                            goto exit_loop;
+    signal(SIGINT, signal_handler);
+    
+    int tries = 0;
+    while (keep_running && tries < MAX_TRIES) {
+        if (send_icmp_request(handle, interface, src_ip, dest_ip) < 0) {
+            fprintf(stderr, "ICMP isteği gönderilemedi\n");
+            break;
+        }
 
-                        case 0x03:  // Destination Unreachable
-                            switch(recv_packet[35]) {
-                                case 0x00:
-                                    printf("ICMP Destination Unreachable (Network Unreachable) alındı.\n");
-                                    break;
-                                case 0x01:
-                                    printf("ICMP Destination Unreachable (Host Unreachable) alındı.\n");
-                                    break;
-                                case 0x02:
-                                    printf("ICMP Destination Unreachable (Protocol Unreachable) alındı.\n");
-                                    break;
-                                case 0x03:
-                                    printf("ICMP Destination Unreachable (Port Unreachable) alındı.\n");
-                                    break;
-                                case 0x04:
-                                    printf("ICMP Destination Unreachable (Fragmentation Needed and Don't Fragment was Set) alındı.\n");
-                                    break;
-                                case 0x05:
-                                    printf("ICMP Destination Unreachable (Source Route Failed) alındı.\n");
-                                    break;
-                                case 0x06:
-                                    printf("ICMP Destination Unreachable (Destination Network Unknown) alındı.\n");
-                                    break;
-                                case 0x07:
-                                    printf("ICMP Destination Unreachable (Destination Host Unknown) alındı.\n");
-                                    break;
-                                case 0x08:
-                                    printf("ICMP Destination Unreachable (Source Host Isolated) alındı.\n");
-                                    break;
-                                case 0x09:
-                                    printf("ICMP Destination Unreachable (Network Administratively Prohibited) alındı.\n");
-                                    break;
-                                case 0x0a:
-                                    printf("ICMP Destination Unreachable (Host Administratively Prohibited) alındı.\n");
-                                    break;
-                                case 0x0b:
-                                    printf("ICMP Destination Unreachable (Network Unreachable for TOS) alındı.\n");
-                                    break;
-                                case 0x0c:
-                                    printf("ICMP Destination Unreachable (Host Unreachable for TOS) alındı.\n");
-                                    break;
-                                case 0x0d:
-                                    printf("ICMP Destination Unreachable (Communication Administratively Prohibited) alındı.\n");
-                                    break;
-                                default:
-                                    printf("ICMP Destination Unreachable (Unknown Code: %d) alındı.\n", recv_packet[35]);
-                                    break;
-                            }
-                            goto exit_loop;
+        struct pcap_pkthdr *header;
+        const u_char *packet;
+        int res;
 
-                        case 0x04:  // Source Quench
-                            printf("ICMP Source Quench alındı.\n");
-                            goto exit_loop;
+        timeout_tv.tv_sec = TIMEOUT_SEC;
+        timeout_tv.tv_usec = 0;
 
-                        case 0x05:  // Redirect
-                            switch(recv_packet[35]) {
-                                case 0x00:
-                                    printf("ICMP Redirect (Redirect Datagram for the Network) alındı.\n");
-                                    break;
-                                case 0x01:
-                                    printf("ICMP Redirect (Redirect Datagram for the Host) alındı.\n");
-                                    break;
-                                case 0x02:
-                                    printf("ICMP Redirect (Redirect Datagram for the TOS & Network) alındı.\n");
-                                    break;
-                                case 0x03:
-                                    printf("ICMP Redirect (Redirect Datagram for the TOS & Host) alındı.\n");
-                                    break;
-                                default:
-                                    printf("ICMP Redirect (Unknown Code: %d) alındı.\n", recv_packet[35]);
-                                    break;
-                            }
-                            goto exit_loop;
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET(pcap_get_selectable_fd(handle), &read_set);
 
-                        case 0x09:  // Router Advertisement
-                            printf("ICMP Router Advertisement alındı.\n");
-                            goto exit_loop;
-
-                        case 0x0a:  // Router Solicitation
-                            printf("ICMP Router Solicitation alındı.\n");
-                            goto exit_loop;
-
-                        case 0x0b:  // Time Exceeded
-                            switch(recv_packet[35]) {
-                                case 0x00:
-                                    printf("ICMP Time Exceeded (Time to Live Exceeded in Transit) alındı.\n");
-                                    break;
-                                case 0x01:
-                                    printf("ICMP Time Exceeded (Fragment Reassembly Time Exceeded) alındı.\n");
-                                    break;
-                                default:
-                                    printf("ICMP Time Exceeded (Unknown Code: %d) alındı.\n", recv_packet[35]);
-                                    break;
-                            }
-                            goto exit_loop;
-
-                        case 0x0d:  // Timestamp
-                            printf("ICMP Timestamp alındı.\n");
-                            goto exit_loop;
-
-                        case 0x0e:  // Timestamp Reply
-                            printf("ICMP Timestamp Reply alındı.\n");
-                            goto exit_loop;
-
-                        case 0x0f:  // Information Request
-                            printf("ICMP Information Request alındı.\n");
-                            goto exit_loop;
-
-                        case 0x10:  // Information Reply
-                            printf("ICMP Information Reply alındı.\n");
-                            goto exit_loop;
-
-                        case 0x11:  // Address Mask Request
-                            printf("ICMP Address Mask Request alındı.\n");
-                            goto exit_loop;
-
-                        case 0x12:  // Address Mask Reply
-                            printf("ICMP Address Mask Reply alındı.\n");
-                            goto exit_loop;
-
-                        case 0x1e:  // Traceroute
-                            printf("ICMP Traceroute alındı.\n");
-                            goto exit_loop;
-
-                        default:
-                            printf("Bilinmeyen ICMP türü (0x%02x) alındı.\n", recv_packet[34]);
-                            goto exit_loop;
-                    }
-                } else {
-                    printf("Yanıt farklı bir hedef IP'ye gönderilmiş!\n");
-                }
-            } else {
-                printf("Yanıt farklı bir kaynaktan geldi!\n");
+        res = select(pcap_get_selectable_fd(handle) + 1, &read_set, NULL, NULL, &timeout_tv);
+        if (res == 0) {
+            printf("Deneme %d: Timeout - Yanıt alınamadı\n", tries + 1);
+            tries++;
+            continue;
+        }
+        else if (res < 0) {
+            if (errno != EINTR) {
+                perror("select");
+                break;
             }
+            continue;
+        }
+
+        res = pcap_next_ex(handle, &header, &packet);
+        if (res < 0) break;
+        if (res == 0) continue;
+
+        if (process_packet(packet, header->len)) {
+            break;
         }
     }
-    exit_loop:
+
+    if (tries >= MAX_TRIES) {
+        printf("\nMaksimum deneme sayısına ulaşıldı. Hedef yanıt vermiyor.\n");
+    }
 
     cleanup();
+    pcap_freealldevs(alldevs);
     return 0;
 }
