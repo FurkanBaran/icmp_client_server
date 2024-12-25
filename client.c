@@ -40,7 +40,7 @@ typedef struct {
     uint8_t tos;                  // Hizmet türü
     uint16_t total_length;        // Toplam uzunluk
     uint16_t identification;      // Tanımlama
-    uint16_t flags_fragment_offset; // Bayraklar ve fragment ofseti
+    uint16_t flags_fragment_offset; // Bayraklar ve fragment offseti
     uint8_t ttl;                  // Zaman aşımı değeri
     uint8_t protocol;             // Protokol
     uint16_t header_checksum;     // Başlık kontrol toplamı
@@ -49,10 +49,10 @@ typedef struct {
 } IPHeader;
 
 pcap_t *handle = NULL;                 // pcap arayüzü için tanımlama
-volatile sig_atomic_t keep_running = 1; // Programın çalışmaya devam edip etmeyeceğini belirten bayrak
+volatile sig_atomic_t keep_running = 1; // Programın çalışmaya devam edip etmeyeceğini belirten flag
 struct timeval timeout_tv;             // Zaman aşımı için timeval yapısı
 unsigned short sequence = 0;           // ICMP paketleri için sıra numarası
-char source_ip_str[INET_ADDRSTRLEN];   // Kaynak IP adresini tutmak için karakter dizisi
+char source_ip_str[INET_ADDRSTRLEN];   // Kaynak IP adresini tutmak char dizisi
 
 // Paket bilgilerini ekrana yazdıran fonksiyon
 void print_packet_info(const u_char *packet, int is_sent) {
@@ -107,7 +107,7 @@ void cleanup() {
     }
 }
 
-// Kontrol toplamı hesaplama fonksiyonu (ICMP ve IP başlıkları için)
+// Checksum hesaplama fonksiyonu (ICMP ve IP başlıkları için)
 unsigned short calculate_checksum(unsigned short *addr, int len) {
     int nleft = len;             // Kalan bayt sayısı
     int sum = 0;                 // Toplam
@@ -131,7 +131,7 @@ unsigned short calculate_checksum(unsigned short *addr, int len) {
     sum += (sum >> 16);                 // Eğer tekrar taşma varsa ekle
     answer = ~sum;                      // Tüm bitleri ters çevir
 
-    return answer; // Kontrol toplamını döndür
+    return answer; // toplamı döndür
 }
 
 // Verilen arayüzün IP adresini alan fonksiyon
@@ -218,7 +218,7 @@ int send_icmp_request(pcap_t *handle, const char *interface,
     icmp->identifier = htons(getpid() & 0xFFFF);      // Tanımlayıcı olarak işlem ID'si
     icmp->sequence = htons(++sequence);               // Sıra numarasını artır ve ata
     icmp->checksum = 0;                               // Kontrol toplamını sıfırla
-    icmp->checksum = calculate_checksum((unsigned short *)icmp, sizeof(ICMPHeader)); // Kontrol toplamını hesapla
+    icmp->checksum = calculate_checksum((unsigned short *)icmp, sizeof(ICMPHeader)); // Checksum hesapla
 
     // Paket bilgilerini ekrana yazdır
     print_packet_info(packet, 1);
