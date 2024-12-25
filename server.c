@@ -122,7 +122,7 @@ void print_packet_info(const u_char *packet, int is_sent) {
     printf("  Sequence: 0x%04x\n", ntohs(icmp->sequence));
 }
 
-// Kontrol toplamı hesaplama fonksiyonu (IP ve ICMP başlıkları için)
+// Checksum hesaplama fonksiyonu (IP ve ICMP başlıkları için)
 unsigned short calculate_checksum(unsigned short *addr, int len) {
     int nleft = len;             // Kalan bayt sayısı
     int sum = 0;                 // Toplam
@@ -146,7 +146,7 @@ unsigned short calculate_checksum(unsigned short *addr, int len) {
     sum += (sum >> 16);                 // Eğer tekrar taşma varsa ekle
     answer = ~sum;                      // Tüm bitleri ters çevir
 
-    return answer; // Kontrol toplamını döndür
+    return answer; // Checksum döndür
 }
 
 // Verilen arayüzün IP adresini alan fonksiyon
