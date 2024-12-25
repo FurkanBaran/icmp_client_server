@@ -1,6 +1,22 @@
 {
     "configurations": [
         {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**"
+            ],
+            "compilerArgs": [
+                    "-Wall",
+                    "-Wextra",
+                    "-pthread",
+                    "-lpcap"
+                ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        },
+        {
             "name": "Mac",
             "includePath": [
                 "${workspaceFolder}/**"
