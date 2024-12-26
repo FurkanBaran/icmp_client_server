@@ -249,6 +249,21 @@ int process_packet(const u_char *packet, int len) {
     // ICMP başlığını al
     ICMPHeader *icmp = (ICMPHeader *)(packet + sizeof(struct ethhdr) + sizeof(IPHeader));
 
+
+    char recv_dest_ip[INET_ADDRSTRLEN];
+    // Paketin hedef IP'sini stringe çevir
+    inet_ntop(AF_INET, &(ip->dest_ip), recv_dest_ip, INET_ADDRSTRLEN);
+
+    // Karşılaştırma
+    if (strcmp(recv_dest_ip, source_ip_str) != 0) {
+        printf("Yanıt bizim IP'mize gönderilmemiş.\n");
+        printf("Paketin hedef IP'si: %s, Bizim IP: %s\n", recv_dest_ip, source_ip_str);
+        return 0;
+    }
+
+
+
+
     // Paket bilgilerini ekrana yazdır
     print_packet_info(packet, 0);
 
@@ -355,6 +370,7 @@ int main(int argc, char *argv[]) {
     printf("Hedef IP: %s\n", argv[1]);
 
     inet_pton(AF_INET, source_ip, &src_ip);
+    strcpy(source_ip_str, source_ip); // Kaynak IP adresini sakla
 
     // Ağ arayüzünü aç
     handle = pcap_open_live(interface, BUFSIZ, 1, 1000, errbuf);
