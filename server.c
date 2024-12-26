@@ -341,8 +341,20 @@ int main() {
         // Paket alımı
         int res = pcap_next_ex(handle, &header, &packet);
         if (res > 0) {
+            // IP başlığını al
+            IPHeader *ip_request = (IPHeader *)(packet + sizeof(struct eth_header));
+
+            // Hedef IP'yi kontrol et
+            char dest_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(ip_request->dest_ip), dest_ip, INET_ADDRSTRLEN);
+
+            // Eğer hedef IP sunucunun IP'si değilse paketi işleme
+            if (strcmp(dest_ip, server_ip) != 0) {
+                continue; // Bir sonraki pakete geç
+            }
+
             // Paket alındı, işlem yap
-            packets_received++;
+            packets_received++; // Alınan paket sayısını artır
             printf("\nICMP Echo Request alındı (#%lu)\n", packets_received);
             print_packet_info(packet, 0); // Paket bilgilerini yazdır
             send_icmp_reply(handle, packet); // ICMP Echo Reply yanıtını gönder
